@@ -7,6 +7,8 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- Document the Linux index limitations: NFS/FUSE/procfs/sysfs roots stay Offline and never back an index, inotify events cannot be replayed across processes, and a restarted worker always rebuilds cold (#608).
+- 记录 Linux 索引限制：NFS/FUSE/procfs/sysfs 根保持 Offline、不支撑索引，inotify 事件无法跨进程回放，重启的 worker 只能冷重建（#608）。
 - Preserve exact-head fork PR CI evidence with empty Actions associations, including approval-required runs, and report GitHub mergeability with its base identity separately from local merge probes (#495).
 - 保留 Actions 关联为空的 fork PR 准确 head CI 证据（含待批准运行），并将 GitHub 可合并性及其基线身份与本地合并预演分开报告（#495）。
 - Report PowerShell ConstrainedLanguage before workspace ACL preparation and preserve a named diagnostic without changing security policy (#458). / 工作区 ACL 准备前明确报告 PowerShell ConstrainedLanguage，并保留具名诊断，不改变安全策略（#458）。

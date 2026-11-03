@@ -30,12 +30,14 @@
 //! reconciliation slice (W4) is what makes every name visible; W1 must not
 //! invent links it cannot prove.
 //!
-//! Candidate.key.file is the low 48-bit record number, the identifier cap-std
-//! reports as ino() on NTFS. The full 64-bit file reference (record number plus
-//! sequence) stays inside the volume index so a caller-visible key never
-//! carries a generation; FileKey.volume is 0 until W2/W3 can report a real
-//! volume serial without a raw Win32 call.
+//! Identity is cap-fs-ext's identity: Candidate.key.file is the full 64-bit
+//! nFileIndex (the MFT file reference, record number in the low 48 bits and
+//! sequence in the high 16) and Candidate.key.volume is the volume serial
+//! number read through cap-std from the volume root's directory metadata. A
+//! candidate key therefore compares equal to cap-fs-ext's (dev, ino), which is
+//! what lets the integration trust an indexed hit without an id-drift fallback.
 
+use cap_fs_ext::MetadataExt;
 use ops_index::{Candidate, CandidateSet, EntryKind, EnumBudget, FileKey, SourceError};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -48,8 +50,12 @@ use usn_journal_rs::{Fid, FileAttributes, UsnError, volume::Volume};
 /// How many enumerated or assembled nodes run between two deadline checks.
 pub const DEADLINE_CHECK_EVERY: usize = 4096;
 
-/// FileKey.volume until a metadata boundary can report a real serial.
-const UNKNOWN_VOLUME: u64 = 0;
+/// Hard cap on the whole-volume MFT node map this crate will build.
+///
+/// A query is one-shot and must not allocate without limit for a multi-million
+/// record volume; exceeding the cap answers SourceError::Budget so the caller
+/// falls back to its own traversal.
+pub const MAX_MFT_NODES: usize = 1 << 20;
 
 /// One MFT record reduced to what path assembly needs.
 #[derive(Clone, Debug)]
@@ -67,6 +73,48 @@ pub(crate) struct ColdBatch {
     pub(crate) truncated: bool,
 }
 
+/// A volume opened for one request plus the identity read from its root.
+pub(crate) struct OpenedVolume {
+    pub(crate) volume: Volume,
+    pub(crate) volume_serial: u64,
+    pub(crate) root_components: Vec<OsString>,
+}
+
+/// Opens the volume that hosts root and reads its serial number.
+///
+/// This is the only path that touches the file system besides the kernel
+/// enumeration. The ambient authority is used once, on the volume root, for
+/// directory metadata only; it never widens what the caller may open.
+pub(crate) fn open_for_root(root: &Path) -> Result<OpenedVolume, SourceError> {
+    let metadata = fs::metadata(root).map_err(|error| SourceError::Io(error.kind()))?;
+    if !metadata.is_dir() {
+        return Err(SourceError::Io(ErrorKind::NotADirectory));
+    }
+    if !process_is_elevated()? {
+        // The documented fallback: no Administrator privileges means no
+        // index-capable source, and the caller uses its own traversal.
+        return Err(SourceError::Unsupported);
+    }
+    let (volume_root, root_components) = split_volume_root(root)?;
+    let volume = Volume::from_mount_point(&volume_root).map_err(map_usn_error)?;
+    let volume_serial = volume_serial(&volume_root)?;
+    Ok(OpenedVolume {
+        volume,
+        volume_serial,
+        root_components,
+    })
+}
+
+/// Reads the volume serial number exactly as cap-fs-ext dev() reports it.
+fn volume_serial(volume_root: &Path) -> Result<u64, SourceError> {
+    let root_dir = cap_std::fs::Dir::open_ambient_dir(volume_root, cap_std::ambient_authority())
+        .map_err(|error| SourceError::Io(error.kind()))?;
+    let metadata = root_dir
+        .dir_metadata()
+        .map_err(|error| SourceError::Io(error.kind()))?;
+    Ok(metadata.dev())
+}
+
 /// Cold enumeration of root within budget.
 ///
 /// # Errors
@@ -81,20 +129,15 @@ pub fn cold_candidates(root: &Path, budget: EnumBudget) -> Result<CandidateSet, 
     if budget.expired() {
         return Err(SourceError::Budget);
     }
-    let metadata = fs::metadata(root).map_err(|error| SourceError::Io(error.kind()))?;
-    if !metadata.is_dir() {
-        return Err(SourceError::Io(ErrorKind::NotADirectory));
-    }
-    if !process_is_elevated()? {
-        // The documented fallback: no Administrator privileges means no
-        // index-capable source, and the caller uses its own traversal.
-        return Err(SourceError::Unsupported);
-    }
-    let (volume_root, root_components) = split_volume_root(root)?;
-    let volume = Volume::from_mount_point(&volume_root).map_err(map_usn_error)?;
-    let nodes = collect_nodes(&volume, &budget)?;
+    let opened = open_for_root(root)?;
+    let nodes = collect_nodes(&opened.volume, &budget)?;
     let consistent_at_ms = now_ms();
-    let batch = assemble(&nodes, &root_components, &budget)?;
+    let batch = assemble(
+        &nodes,
+        &opened.root_components,
+        opened.volume_serial,
+        &budget,
+    )?;
     Ok(CandidateSet {
         entries: batch.entries,
         truncated: batch.truncated,
@@ -103,12 +146,23 @@ pub fn cold_candidates(root: &Path, budget: EnumBudget) -> Result<CandidateSet, 
 }
 
 /// Whether this process can open a volume handle; errors map to Unsupported.
-fn process_is_elevated() -> Result<bool, SourceError> {
+pub(crate) fn process_is_elevated() -> Result<bool, SourceError> {
     usn_journal_rs::privilege::is_elevated().map_err(|_| SourceError::Unsupported)
 }
 
-/// Collects every MFT record, refusing 128-bit ids.
-fn collect_nodes(volume: &Volume, budget: &EnumBudget) -> Result<Vec<MftNode>, SourceError> {
+/// Enforces the whole-volume node cap before the next push.
+pub(crate) fn check_node_budget(nodes: usize) -> Result<(), SourceError> {
+    if nodes >= MAX_MFT_NODES {
+        return Err(SourceError::Budget);
+    }
+    Ok(())
+}
+
+/// Collects every MFT record, refusing 128-bit ids and capping the map.
+pub(crate) fn collect_nodes(
+    volume: &Volume,
+    budget: &EnumBudget,
+) -> Result<Vec<MftNode>, SourceError> {
     let mut nodes = Vec::new();
     let mut seen = 0usize;
     for item in volume.mft().iter() {
@@ -121,6 +175,7 @@ fn collect_nodes(volume: &Volume, budget: &EnumBudget) -> Result<Vec<MftNode>, S
             // ReFS: FileKey only has 64 bits for the file half.
             return Err(SourceError::Unsupported);
         }
+        check_node_budget(nodes.len())?;
         nodes.push(MftNode {
             fid: entry.fid,
             parent: entry.parent_fid,
@@ -177,10 +232,59 @@ fn plain_mount(mount: &Path) -> PathBuf {
     mount.to_path_buf()
 }
 
+/// Relative paths of every entry below the requested root, keyed by file id.
+///
+/// The map includes the requested root itself with an empty path, so a journal
+/// event can resolve its parent directory without a special case. The node cap
+/// and the cycle guard keep this bounded even for a damaged parent graph.
+pub(crate) struct SubtreePaths {
+    pub(crate) paths: HashMap<u64, PathBuf>,
+}
+
+/// Rebuilds the requested subtree's relative paths. Pure: no IO, no clock.
+pub(crate) fn subtree_paths(
+    nodes: &[MftNode],
+    root_components: &[OsString],
+) -> Result<SubtreePaths, SourceError> {
+    let mut by_fid: HashMap<u64, usize> = HashMap::with_capacity(nodes.len());
+    let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let fid = node.fid.as_u64().ok_or(SourceError::Unsupported)?;
+        let parent = node.parent.as_u64().ok_or(SourceError::Unsupported)?;
+        by_fid.entry(fid).or_insert(index);
+        children.entry(parent).or_default().push(index);
+    }
+    let volume_root = find_volume_root(nodes, &by_fid).ok_or(SourceError::Unsupported)?;
+    let root_fid = resolve_root(nodes, volume_root, root_components)?;
+    let mut paths: HashMap<u64, PathBuf> = HashMap::new();
+    paths.insert(root_fid, PathBuf::new());
+    let mut visited: HashSet<u64> = HashSet::new();
+    visited.insert(root_fid);
+    let mut queue = vec![root_fid];
+    while let Some(fid) = queue.pop() {
+        let Some(indexes) = children.get(&fid) else {
+            continue;
+        };
+        let base = paths.get(&fid).cloned().unwrap_or_default();
+        for index in indexes {
+            let node = &nodes[*index];
+            let child = node.fid.as_u64().ok_or(SourceError::Unsupported)?;
+            if !visited.insert(child) {
+                continue;
+            }
+            let rel = base.join(&node.name);
+            paths.insert(child, rel);
+            queue.push(child);
+        }
+    }
+    Ok(SubtreePaths { paths })
+}
+
 /// Rebuilds candidates from MFT records. Pure: no IO, no clock, no handles.
 pub(crate) fn assemble(
     nodes: &[MftNode],
     root_components: &[OsString],
+    volume_serial: u64,
     budget: &EnumBudget,
 ) -> Result<ColdBatch, SourceError> {
     if budget.expired() {
@@ -231,15 +335,11 @@ pub(crate) fn assemble(
                 continue;
             }
             let rel = base.join(&node.name);
-            // FileKey.file is the low 48-bit record number, the same value
-            // cap-std reports as ino() on NTFS; the sequence number stays in
-            // the volume index, never in a caller-visible key.
-            let record_number = Fid::new(child_fid)
-                .record_number()
-                .ok_or(SourceError::Unsupported)?;
+            // (volume serial, full 64-bit nFileIndex) is exactly what
+            // cap-fs-ext reports as (dev(), ino()) for an open handle.
             entries.push(Candidate {
                 rel: rel.clone(),
-                key: FileKey::new(UNKNOWN_VOLUME, record_number),
+                key: FileKey::new(volume_serial, child_fid),
                 kind: kind_of(node.attributes),
                 len: 0,
                 modified_ns: None,
@@ -328,7 +428,7 @@ pub(crate) fn map_usn_error(error: UsnError) -> SourceError {
 }
 
 /// Wall-clock milliseconds since the Unix epoch.
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
         Err(before) => -i64::try_from(before.duration().as_millis()).unwrap_or(i64::MAX),

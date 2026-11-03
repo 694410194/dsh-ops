@@ -514,6 +514,8 @@ dependencies = [
 name = "ops-win-index"
 version = "0.5.0-alpha3"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "ops-index",
  "usn-journal-rs",
 ]

@@ -388,7 +388,11 @@ fn an_idle_live_stream_reports_no_events() {
     assert!(!batch.dropped);
     assert!(!batch.event_ids_wrapped);
     assert!(!batch.history_done);
-    assert_eq!(batch.latest, EventId::SINCE_NOW);
+    // A live stream seeds its cursor with a real journal id at open time (see
+    // the live-cursor test); it must never hand out the SINCE_NOW sentinel.
+    assert!(batch.latest > EventId::from_raw(0));
+    assert!(!batch.latest.is_since_now());
+    assert!(batch.latest <= EventStream::current_event_id());
 }
 
 #[test]

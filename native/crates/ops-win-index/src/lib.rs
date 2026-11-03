@@ -15,9 +15,10 @@
 //! `FSCTL_ENUM_USN_DATA`/`FSCTL_READ_USN_JOURNAL` reads for the cases
 //! usn-journal-rs does not express (explicit start file reference, reason mask,
 //! `ReturnOnlyOnClose`, wait hints and caller-owned page buffers). Parsing stays
-//! in `ops_index::usn`; the crate's only `unsafe` lives in that module, behind
-//! a safe `VolumeHandle`/`VolumeIo` boundary, with `unsafe_op_in_unsafe_fn`
-//! denied and a SAFETY comment on every block.
+//! in `ops_index::usn`. The crate's `unsafe` lives in two allowed islands
+//! inside `winfs`: `winfs::sys` for `FSCTL_*` and `winfs::links` for W4's
+//! `FindFirstFileNameW`/`FindNextFileNameW`; each sits behind a safe boundary
+//! with `unsafe_op_in_unsafe_fn` denied and a SAFETY comment on every block.
 //!
 //! The whole crate body is behind #![cfg(windows)], so every other target
 //! compiles an empty library and the workspace stays green. The Windows-only

@@ -52,7 +52,6 @@
 pub mod links;
 pub mod mft;
 pub mod source;
-#[allow(unsafe_code)]
 pub mod winfs;
 
 pub use links::{
